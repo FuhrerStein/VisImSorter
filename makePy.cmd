@@ -1,0 +1,1 @@
+pyuic5 VisImSorter.ui -o VisImSorterInterface.py
