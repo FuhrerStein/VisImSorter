@@ -358,6 +358,7 @@ def create_groups_v2():
 
 def create_image_distances_db(im_db):
     global progress_value
+    compute_result = []
 
     
 
