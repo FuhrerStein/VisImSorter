@@ -1,4 +1,6 @@
+import fnmatch
 import glob
+import io
 import itertools
 import math
 import multiprocessing as mp
@@ -7,12 +9,6 @@ import random
 import re
 import shutil
 import sys
-import io
-import rawpy
-import fnmatch
-
-import psutil
-
 from itertools import chain
 from multiprocessing import Process, Queue
 from time import sleep
@@ -20,23 +16,26 @@ from timeit import default_timer as timer
 
 import PyQt5.QtCore
 import matplotlib.animation as animation
+import matplotlib.colors as mc
 import matplotlib.patches as patches
 import matplotlib.path as path
 import matplotlib.pyplot as plt
 import matplotlib.text as mtext
-import matplotlib.colors as mc
 import numpy as np
+import numpy.ma as ma
+import psutil
+import rawpy
 from PIL import Image
-from PIL import ImageFilter
+# from PyQt5.QtGui import QPalette
 from PyQt5.QtWidgets import QMessageBox, QFileDialog, QApplication, QMainWindow
 from PySide2.QtCore import QTimer
-from PyQt5.QtGui import QPalette, QColor
 from scipy import ndimage
+
 import VisImSorterInterface
 
 image_DB = []
 group_db = []
-grouped_image_db = []
+# grouped_image_db = []
 distance_db = []
 target_groups = 0
 target_group_size = 0
@@ -51,10 +50,10 @@ new_folder = ""
 new_vector_folder = ""
 status_text = ""
 search_subdirectories = False
-group_by_file_count = False
+# group_by_file_count = False
 enforce_equal_folders = 0.
 hg_bands_count = 0
-compare_file_percent = 0
+compare_file_percent = 10
 selected_color_spaces = []
 selected_color_subspaces = []
 move_files_not_copy = False
@@ -63,7 +62,7 @@ export_histograms = False
 create_samples_enabled = False
 run_index = 0
 abort_reason = ""
-optimization_queue = []
+# optimization_queue = []
 gaussian_filter1d = ndimage.filters.gaussian_filter1d
 median_filter = ndimage.filters.median_filter
 gaussian_filter = ndimage.filters.gaussian_filter
@@ -73,12 +72,16 @@ folder_size_min_files = 0
 # min_folder_size_set_in_percent = False
 final_sort = 0
 group_with_similar_name = 0
-plain_file_types = ['jpg', 'png', 'jpeg']
+plain_file_types = ['jpg', 'png', 'jpeg', 'gif']
 raw_file_types = ['nef', 'dng']
-process_version = 0
+# process_version = 0
+# power_coefficient = 1
+folder_constraint_type = 0
+folder_constraint_value = 0
+stage1_grouping_type = 0
+enable_stage2_grouping = False
 
-
-# todo: option to change subfolder naming cheme (add color into the name, number of files)
+# todo: option to change subfolder naming scheme (add color into the name, number of files)
 # todo: search similar images to sample image or sample folder with images
 # todo: sort final folders by: (average color, average lightness, file count, ...)
 # todo: compare using 3D histograms
@@ -88,6 +91,28 @@ process_version = 0
 # todo: modify sorting algorithm so that final number of folders is roughly equal to desired
 # todo: initial grouping is made only using image pairs rather than group pairs
 # todo: when searching for closest pairs, sort also by other bands, not only by HSV hue
+
+'''Алгоритм выделения связных компонент
+
+В алгоритме выделения связных компонент задается входной параметр R и в графе удаляются все ребра, для которых 
+«расстояния» больше R. Соединенными остаются только наиболее близкие пары объектов. Смысл алгоритма заключается в 
+том, чтобы подобрать такое значение R, лежащее в диапазон всех «расстояний», при котором граф «развалится» на 
+несколько связных компонент. Полученные компоненты и есть кластеры. 
+
+Для подбора параметра R обычно строится гистограмма распределений попарных расстояний. В задачах с хорошо выраженной 
+кластерной структурой данных на гистограмме будет два пика – один соответствует внутрикластерным расстояниям, 
+второй – межкластерным расстояния. Параметр R подбирается из зоны минимума между этими пиками. При этом управлять 
+количеством кластеров при помощи порога расстояния довольно затруднительно. 
+
+
+Алгоритм минимального покрывающего дерева
+
+Алгоритм минимального покрывающего дерева сначала строит на графе минимальное покрывающее дерево, 
+а затем последовательно удаляет ребра с наибольшим весом. 
+
+
+
+'''
 
 
 def start_process():
@@ -125,21 +150,35 @@ def start_process():
         pool.close()
         return
 
-    if process_version == 0:
-        if compare_file_percent == 0:
-            create_simple_groups()
-        else:
-            create_groups_by_similarity()
+    if stage1_grouping_type == 0:
+        create_simple_groups()
+        if local_run_index != run_index:
+            pool.terminate()
             pool.close()
-            if local_run_index != run_index:
-                return
-            stage2_sort()
-            if local_run_index != run_index:
-                return
-    else:
-        create_groups_v2()
+            return
+    elif stage1_grouping_type == 1:
+        create_groups_by_similarity()
+        if local_run_index != run_index:
+            pool.terminate()
+            pool.close()
+            return
+    elif stage1_grouping_type == 2:
+        create_groups_v4()
+        if local_run_index != run_index:
+            pool.terminate()
+            pool.close()
+            return
 
-    # pool.close()
+    if enable_stage2_grouping:
+        stage2_regroup()
+        if local_run_index != run_index:
+            pool.terminate()
+            pool.close()
+            return
+
+    final_group_sort()
+
+    pool.close()
 
     choose_destination_folder()
     move_files()
@@ -183,10 +222,6 @@ def scan_for_images():
     types = plain_file_types + raw_file_types
     image_paths = []
     image_paths_grouped = []
-    subdir_mask = "/*."
-
-    if search_subdirectories:
-        subdir_mask = "/**/*."
 
     all_files = glob.glob(start_folder + "/**/*", recursive=search_subdirectories)
 
@@ -200,7 +235,7 @@ def scan_for_images():
     if len(image_paths) == 0:
         abort_reason = "No images found."
         run_index += 1
-        QMessageBox.warning(None, "Error", abort_reason)
+        QMessageBox.warning(None, "VisImSorter: Error", abort_reason)
         print(abort_reason)
     elif group_with_similar_name > 0:
         file_name_groups = sorted(image_paths, key=lambda x: os.path.basename(x)[:group_with_similar_name])
@@ -226,8 +261,10 @@ def generate_image_vectors_and_groups(image_list):
     global abort_reason
     global pool
     global folder_size_min_files
-    global folder_size_min_percent
+    # global folder_size_min_percent
     # global min_folder_size_set_in_percent
+    global folder_constraint_type
+    global folder_constraint_value
 
     local_run_index = run_index
     image_count = len(image_list)
@@ -263,13 +300,12 @@ def generate_image_vectors_and_groups(image_list):
     if local_run_index != run_index:
         return
 
-    if group_by_file_count:
-        target_groups = int(round(real_image_count / target_group_size))
-    else:
+    if folder_constraint_type:
+        target_groups = int(folder_constraint_value)
         target_group_size = int(round(real_image_count / target_groups))
-
-    # if min_folder_size_set_in_percent:
-    #     folder_size_min_files = round(folder_size_min_percent * target_group_size / 100)
+    else:
+        target_group_size = int(folder_constraint_value)
+        target_groups = int(round(real_image_count / target_group_size))
 
 
 def generate_image_vector_callback(vector_pack):
@@ -280,7 +316,7 @@ def generate_image_vector_callback(vector_pack):
     if vector_pack is not None:
         image_DB.append(vector_pack)
     progress_value += 1
-    status_text = "Generating image histograms... (" \
+    status_text = "(1/4) Generating image histograms... (" \
                   + str(progress_value) + " of " + str(image_count) + ")"
     QApplication.processEvents()
 
@@ -341,7 +377,8 @@ def create_simple_groups():
     group_db = sorted(group_db, key=lambda x: x[2])
     groups_count = len(group_db)
 
-def create_groups_v2():
+
+def create_groups_v4():
     global image_count
     global status_text
     global target_groups
@@ -351,52 +388,148 @@ def create_groups_v2():
     global group_db
     global image_DB
     global distance_db
-    local_run_index = run_index
-
-    create_image_distances_db(image_DB)
-
-
-def create_image_distances_db(im_db):
+    global progress_max
     global progress_value
-    compute_result = []
 
-    
+    local_run_index = run_index
+    batches = 1
+    batch = 0
+    compare_limit = int(compare_file_percent * (image_count + 2000) / 200)
 
-    # groups_count_l = len(group_db_l)
-    # compute_result = []
-    # simple_counter = 10
-    # for index_1 in range(batch, groups_count_l, batches):
-    #     # min_distance = float("inf")
-    #     best_pair = None
-    #     min_distance = float("inf")
-    #     end_of_search_window = index_1 + compare_lim
-    #     if groups_count_l >= end_of_search_window:
-    #         second_range = range(index_1 + 1, end_of_search_window)
-    #     else:
-    #         rest_of_search_window = min(end_of_search_window - groups_count_l, index_1)
-    #         second_range = chain(range(index_1 + 1, groups_count_l), range(0, rest_of_search_window))
-    #     # image_distances = []
-    #     for index_2 in second_range:
-    #         vector_distance = la_norm(group_db_l[index_1][1].astype(np.int32) - group_db_l[index_2][1].astype(np.int32))
-    #         size_factor = (group_db_l[index_1][3] + group_db_l[index_2][3]) / target_gs
-    #         vector_distance *= (size_factor ** enforce_ef)
-    #         if min_distance > vector_distance:
-    #             min_distance = vector_distance
-    #             best_pair = [index_1, index_2]
-    #         # image_distances.append([vector_distance, [index_1, index_2]])
-    #         simple_counter -= 1
-    #         if simple_counter == 0:
-    #             simple_counter = 5000
-    #             if feedback is None:
-    #                 progress_value = index_1
-    #                 QApplication.processEvents()
-    #             else:
-    #                 feedback.put([batch, index_1])
-    #     if best_pair is not None:
-    #         compute_result.append([min_distance] + best_pair)
-    #     # compute_result += sorted(image_distances, key=lambda x: x[0])[:0]  # 5 best places where to put the image
+    groups_history = []
+    groups_open_history = []
+    group_ratings_history = []
+    group_invites_history = []
 
-    return compute_result
+    status_text = "(2/4) Comparing images..."
+    progress_max = image_count
+
+    relations_db = create_relations_db(image_DB, batch, batches, compare_limit)
+
+    status_text = "(3/4) Choosing center images..."
+
+    eef01 = (enforce_equal_folders + .5) ** 2
+    eef01_divisor = np.tanh(eef01) + 1
+
+    groups_open = np.ones(image_count, dtype=bool)
+    invite_count = np.ones(image_count) * target_group_size
+    image_index_list = np.arange(image_count)
+    image_belongings = image_index_list
+    image_belongings_old = image_belongings
+    image_belongings_final = image_belongings
+    mutual_ratings = (np.tanh(eef01 * (1 - relations_db['rank'] / target_group_size)) + 1) / eef01_divisor
+    group_ratings = np.sum((mutual_ratings - np.eye(image_count)) / (1 + relations_db['dist']), axis=1)
+
+    progress_max = 300
+    for _ in range(progress_max):
+        if (image_belongings == image_belongings_old).all():
+            actual_groups = len(np.unique(image_belongings))
+            group_sizes = np.bincount(image_belongings, minlength=image_count)
+            actual_groups2 = len(group_sizes.nonzero())
+            image_belongings_final = image_belongings
+            if actual_groups > target_groups:
+                # image_belongings = image_index_list
+                groups_open = (image_belongings == image_index_list)
+                invite_count *= np.tanh(1 - group_sizes / target_group_size) * groups_open * .2 + 1.2
+                mutual_ratings = (np.tanh(eef01 * (1 - relations_db['rank'] / invite_count)) + 1) / eef01_divisor
+                # if isinstance(group_ratings, int):
+                # print(invite_count)
+            else:
+                break
+
+        groups_history.append(image_belongings)
+        groups_open_history.append(groups_open)
+        # group_ratings_history.append(group_ratings)
+        # group_invites_history.append(group_invites)
+
+        image_belongings_old = image_belongings
+        groups_open_ratings = (image_belongings == image_index_list) * group_ratings
+        group_invites = mutual_ratings * groups_open_ratings
+        image_belongings = np.argmax(group_invites, axis=1)
+
+        closed_groups_indexes = (image_belongings != image_index_list).nonzero()
+        images_in_closed_groups = np.isin(image_belongings, closed_groups_indexes)
+        image_belongings = ma.array(image_belongings, mask=images_in_closed_groups).filled(image_index_list)
+
+        progress_value = _
+        QApplication.processEvents()
+
+    base_image_names = np.array([os.path.basename(i[0][0]) for i in image_DB])
+    save_log(groups_history, "groups_history", base_image_names)
+    save_log(groups_open_history, "groups_open_history", base_image_names)
+
+    status_text = "(4/4) Grouping images..."
+
+    center_index_list = np.unique(image_belongings_final)
+
+    group_db = []
+    for im_n in center_index_list:
+        indexes_in_group = (image_belongings_final == im_n).nonzero()[0].tolist()
+        # indexes_in_group = [im_n]
+        group_db.append([indexes_in_group, None, None, None])
+
+    for grp in group_db:
+        grp[1] = np.mean(np.array([image_DB[i][1] for i in grp[0]]), axis=0)
+        grp[2] = np.argmax(np.sum(np.array([image_DB[i][4] for i in grp[0]]), axis=0))
+        grp[3] = np.sum(np.array([image_DB[i][3] for i in grp[0]]), axis=0)
+    groups_count = len(group_db)
+
+
+#
+# '''
+# desmos
+# wide
+#     \frac{\tanh\left(2.5 + .5\cdot\frac{\left(a - x\right)}{10 - b}\right)}{2} + .5
+#
+# strict
+#     \frac{\tanh\left(\left(1-\frac{x}{a}\right)\cdot\left(a\cdot\frac{b\cdot b}{5}\right)\right)}{2}+.5
+#
+# strict+
+#     \frac{\tanh\left(\left(1-\frac{x}{a}\right)\cdot\left(b^{2}+0.1\right)\right)+1}{\tanh\left(b^{2}+0.1\right)+1}
+#
+# strict+2
+#     \frac{\tanh\left(\left(1-\frac{x}{a}\right)\cdot\left(b^{2}+0.5\right)^{2}\right)+1}{\tanh\left(\left(b^{2}+0.5\right)^{2}\right)+1}
+# '''
+
+
+def create_relations_db(im_db, batch, batches, compare_lim):
+    global progress_value
+    im_count = len(im_db)
+    image_index_list = np.arange(im_count)
+    compare_count = min(compare_lim * 2 + 1, im_count)
+    relations_db = []
+    base_image_coordinates = np.array([i[1] for i in image_DB])
+
+    for im_1 in np.array_split(image_index_list, batches)[batch]:
+        second_range = np.roll(image_index_list, compare_lim - im_1)
+        im_1_db = np.zeros(im_count, dtype=[('dist', np.float), ('rank', np.float), ('im_1', np.int), ('im_2', np.int)])
+        im_1_db['im_1'] = im_1
+        im_1_db['im_2'] = second_range
+        im_1_db['dist'] = np.inf
+        im_1_coord = im_db[im_1][1].astype(np.int32)
+        im_2_coordinates = base_image_coordinates[second_range[:compare_count]].astype(np.int32)
+        vector_distance_line = la_norm(im_2_coordinates - im_1_coord, axis=1)
+        im_1_db[:compare_count]['dist'] = vector_distance_line
+        im_1_db.sort(order='dist')
+        im_1_db['rank'] = image_index_list
+        im_1_db.sort(order='im_2')
+        relations_db.append(im_1_db)
+        progress_value = im_1
+        QApplication.processEvents()
+    relations_db = np.array(relations_db).T
+
+    return relations_db
+
+
+# noinspection PyTypeChecker
+def save_log(log_values, log_name, base_image_names):
+    logs_dir = "y:\\logs\\"
+    if not os.path.isdir(logs_dir):
+        try:
+            os.makedirs(logs_dir)
+        except Exception as e:
+            print("Could not create folder ", e)
+    np.savetxt(logs_dir + log_name + ".csv", np.vstack([base_image_names, log_values]), fmt='%s', delimiter=";")
 
 
 def create_groups_by_similarity():
@@ -494,26 +627,6 @@ def fill_distance_db(feedback_queue, step):
             used_groups += [g1, g2]
         if len(distance_db) > entries_limit:
             break
-'''
-    for dist, g1, g2 in distance_db_unfiltered:
-        # dir_name = get_group_color_name(group_index)
-        dir_name = 'y:\\gropus\\%3d\\%8.3f\\' % (step, dist)
-        try:
-            os.makedirs(dir_name)
-        except Exception as e:
-            print("Could not create folder ", e)
-        for i in (group_db[g1][0] + group_db[g2][0]):
-            for im_path in image_DB[i][0]:
-                try:
-                    shutil.copy(im_path, dir_name)
-                except Exception as e:
-                    print("Could not complete file operation ", e)
-            if local_run_index != run_index:
-                return
-            QApplication.processEvents()
-'''
-    # np.savetxt("y:\\logs\\Pass(%03d).csv" % (step + 1), distance_db, fmt='%1.4d', delimiter=";")
-    # np.savetxt("y:\\logs\\Pass_u(%03d).csv" % (step + 1), distance_db_unfiltered, fmt='%1.4f, %1.4d, %1.4d', delimiter=";")
 
 
 def fill_distance_db_callback(in_result):
@@ -528,7 +641,6 @@ def fill_distance_db_sub(group_db_l, batches, batch, enforce_ef, compare_lim, ta
     compute_result = []
     simple_counter = 10
     for index_1 in range(batch, groups_count_l, batches):
-        # min_distance = float("inf")
         best_pair = None
         min_distance = float("inf")
         end_of_search_window = index_1 + compare_lim
@@ -537,7 +649,6 @@ def fill_distance_db_sub(group_db_l, batches, batch, enforce_ef, compare_lim, ta
         else:
             rest_of_search_window = min(end_of_search_window - groups_count_l, index_1)
             second_range = chain(range(index_1 + 1, groups_count_l), range(0, rest_of_search_window))
-        # image_distances = []
         for index_2 in second_range:
             vector_distance = la_norm(group_db_l[index_1][1].astype(np.int32) - group_db_l[index_2][1].astype(np.int32))
             size_factor = (group_db_l[index_1][3] + group_db_l[index_2][3]) / target_gs
@@ -545,7 +656,6 @@ def fill_distance_db_sub(group_db_l, batches, batch, enforce_ef, compare_lim, ta
             if min_distance > vector_distance:
                 min_distance = vector_distance
                 best_pair = [index_1, index_2]
-            # image_distances.append([vector_distance, [index_1, index_2]])
             simple_counter -= 1
             if simple_counter == 0:
                 simple_counter = 5000
@@ -556,7 +666,6 @@ def fill_distance_db_sub(group_db_l, batches, batch, enforce_ef, compare_lim, ta
                     feedback.put([batch, index_1])
         if best_pair is not None:
             compute_result.append([min_distance] + best_pair)
-        # compute_result += sorted(image_distances, key=lambda x: x[0])[:0]  # 5 best places where to put the image
 
     return compute_result
 
@@ -632,7 +741,7 @@ def stage2_sort_worker(input_q, output_q, im_db, target_group_sz, enforce_ef):
         output_q.put(result)
 
 
-def stage2_sort():
+def stage2_regroup():
     global image_DB
     global group_db
     global groups_count
@@ -642,15 +751,12 @@ def stage2_sort():
     global enforce_equal_folders
     global run_index
     global status_text
-    global optimization_queue
 
     local_run_index = run_index
 
     moved_images = 0
     progress_value = 0
-    iteration = 0
     progress_max = groups_count * groups_count
-    optimization_queue = []
     idle_runs = 0
 
     status_text = "Resorting started... "
@@ -675,7 +781,6 @@ def stage2_sort():
             task_index += 1
             if task_index == groups_count:
                 task_index = 0
-                iteration += 1
                 random.shuffle(lookup_order)
             task_queue.put([group_db, lookup_order[task_index], target_groups_list])
 
@@ -702,6 +807,14 @@ def stage2_sort():
         if local_run_index != run_index:
             break
 
+    for i in range(parallel_processes):
+        task_queue.put('STOP')
+
+
+def final_group_sort():
+    global image_DB
+    global group_db
+
     if final_sort == 0:
         for grp in group_db:
             grp[2] = np.argmax(np.sum(np.array([image_DB[i][3] for i in grp[0]]), axis=0))
@@ -710,9 +823,6 @@ def stage2_sort():
         group_db.sort(key=lambda x: x[3])
     elif final_sort == 2:
         group_db.sort(key=lambda x: x[3], reverse=True)
-
-    for i in range(parallel_processes):
-        task_queue.put('STOP')
 
 
 def move_image_between_groups(task):
@@ -844,10 +954,10 @@ def move_files():
 def get_group_color_name(group_n):
     global group_db
     global new_folder
-    if not "HSV" in selected_color_spaces:
+    if "HSV" not in selected_color_spaces:
         return ""
     for subspace in "HSV":
-        if not subspace in selected_color_subspaces:
+        if subspace not in selected_color_subspaces:
             return ""
 
     # colors_list = mc.CSS4_COLORS
@@ -867,15 +977,7 @@ def get_group_color_name(group_n):
         color_value_hsv = mc.rgb_to_hsv(mc.to_rgb(color_value))
         min_colours[la_norm(color_value_hsv - group_color_one)] = color_name
 
-    best_color = " " + min_colours[min(min_colours.keys())][5:].replace("/", "-")
-    # print(group_color_one, best_color)
-
-    # np.savetxt(new_folder + "Group_vectors_" + str(group_n + 1) + ".csv", group_color.T, delimiter=";",
-    #            fmt='%s', newline='\n')
-    # np.savetxt(new_folder + "Group_vectors_m" + str(group_n + 1) + ".csv", group_color_one, delimiter=";",
-    #            fmt='%s', newline='\n')
-
-    return best_color
+    return " " + min_colours[min(min_colours.keys())][5:].replace("/", "-")
 
 
 def export_image_vectors():
@@ -914,10 +1016,10 @@ def create_samples():
     global progress_value
     global status_text
 
-    if not "HSV" in selected_color_spaces:
+    if "HSV" not in selected_color_spaces:
         return
     for subspace in "HSV":
-        if not subspace in selected_color_subspaces:
+        if subspace not in selected_color_subspaces:
             return
 
     local_run_index = run_index
@@ -938,8 +1040,6 @@ def create_samples():
 
     progress_max = groups_count * 3
     progress_value = 0
-
-    # old_f = 0.
 
     for group_n in range(groups_count):
         im_size = 2000, 1200
@@ -967,12 +1067,10 @@ def create_samples():
 
             img_data_band = np.reshape(img_data_band, (im_size[1] // 2, im_size[0]))
             img_data_band = np.vstack([img_data_band, np.flipud(img_data_band)])
-            # aaa = timer()
             for one_set in roll_settings:
                 img_data_band = roll_rows2(img_data_band, one_set[0], one_set[1])
                 if local_run_index != run_index:
                     return
-            # old_f = old_f + timer() - aaa
 
             gaussian_filter(img_data_band, 2, output=img_data_band, mode='wrap')
             median_filter(img_data_band, 7, output=img_data_band, mode='wrap')
@@ -987,13 +1085,10 @@ def create_samples():
 
         img = Image.merge("HSV", img_data)
 
-        image_RGB = img.convert("RGB")
-        image_RGB.save(new_vector_folder + "Group_" + "%03d" % (group_n + 1) + ".png")
+        image_rgb = img.convert("RGB")
+        image_rgb.save(new_vector_folder + "Group_" + "%03d" % (group_n + 1) + ".png")
 
         status_text = "Generating forlder images. " + "%1d of %1d done." % ((group_n + 1), groups_count)
-
-    # print("new function took " + "%f" % new_f + " seconds.")
-    # print("Generation took " + "%f" % old_f + " seconds.")
 
 
 def roll_rows2(input_layer, axis, max_speed):
@@ -1018,6 +1113,7 @@ def roll_rows2(input_layer, axis, max_speed):
     return input_layer.copy(order='C')
 
 
+# This function is currently not used
 def rotate_squares(input_layer, square_size):
     result = []
     for chunk in np.split(input_layer, input_layer.shape[0] // square_size, 0):
@@ -1030,6 +1126,7 @@ def rotate_squares(input_layer, square_size):
     return result
 
 
+# This function is currently not used
 def shuffle_single_layer(input_layer, square_size):
     w = input_layer.shape[1]
     h = input_layer.shape[0]
@@ -1115,13 +1212,16 @@ class AnimatedHistogram:
 
         t = mtext.Text(3, 2.5, 'text label', ha='left', va='bottom', axes=ax)
 
-        patch_img = patches.PathPatch(path.Path(img_verts, codes), facecolor='darkgreen', edgecolor='darkgreen', alpha=1)
-        patch_grp = patches.PathPatch(path.Path(grp_verts, codes), facecolor='royalblue', edgecolor='royalblue', alpha=1)
+        patch_img = patches.PathPatch(path.Path(img_verts, codes), facecolor='darkgreen', edgecolor='darkgreen',
+                                      alpha=1)
+        patch_grp = patches.PathPatch(path.Path(grp_verts, codes), facecolor='royalblue', edgecolor='royalblue',
+                                      alpha=1)
         ax.add_patch(patch_img)
         ax.add_patch(patch_grp)
         ax.add_artist(t)
 
-        ani = animation.FuncAnimation(fig, animate, interval=800, save_count=10, repeat=False, blit=True)
+        # ani = animation.FuncAnimation(fig, animate, interval=800, save_count=10, repeat=False, blit=True)
+        animation.FuncAnimation(fig, animate, interval=800, save_count=10, repeat=False, blit=True)
         plt.show()
 
 
@@ -1149,12 +1249,6 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         self.select_folder_button.dragEnterEvent = self.directory_entered
         self.select_folder_button.dropEvent = self.directory_dropped
         self.directory_changed()
-
-        self.radio_folder_size.toggled.connect(self.choose_groping_parameter)
-        self.choose_groping_parameter()
-
-        self.slider_compare_limit.valueChanged.connect(self.slider_compare_file_limit_changed)
-        self.slider_compare_file_limit_changed()
 
         self.slider_histogram_bands.valueChanged.connect(self.slider_histogram_bands_changed)
         self.slider_histogram_bands_changed()
@@ -1192,26 +1286,26 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         global create_samples_enabled
         global folder_size_min_files
         global folder_size_min_files
-        global folder_size_min_percent
         global process_version
         global final_sort
         global group_with_similar_name
+        global enable_stage2_grouping
+        global folder_constraint_type
+        global folder_constraint_value
+        global stage1_grouping_type
 
         local_run_index = run_index
 
-        target_groups = self.spin_num_folders.value()
-        target_group_size = self.spin_num_files.value()
+        folder_constraint_type = self.combo_folder_constraints.currentIndex()
+        folder_constraint_value = self.spin_num_constraint.value()
         search_subdirectories = self.check_subdirs_box.isChecked()
         move_files_not_copy = self.radio_move.isChecked()
         show_histograms = self.check_show_histograms.isChecked()
         export_histograms = self.check_export_histograms.isChecked()
-
-        # ss_iterations = self.combo_ss_options.currentIndex()
         create_samples_enabled = self.check_create_samples.isChecked()
-        # min_folder_size_set_in_percent = self.radio_folder_size_min_percent.isChecked()
-        folder_size_min_files = self.spin_folder_size_min_files.value()
-        # folder_size_min_percent = self.spin_folder_size_min_percent.value()
-        process_version = self.V2.isChecked()
+        enable_stage2_grouping = self.check_stage2_grouping.isChecked()
+        stage1_grouping_type = self.combo_stage1_grouping.currentIndex()
+
         final_sort = self.combo_final_sort.currentIndex()
         if self.check_equal_name.isChecked():
             group_with_similar_name = self.spin_equal_first_symbols.value()
@@ -1226,7 +1320,7 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
             selected_color_subspaces += self.get_sub_color_space(item.text())
 
         if len(selected_color_subspaces) == 0:
-            QMessageBox.warning(None, "Error",
+            QMessageBox.warning(None, "VisImSorter: Error",
                                 "Please select at least one color space and at least one sub-color space")
             return
 
@@ -1254,19 +1348,19 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
             self.enable_elements()
 
     def get_sub_color_space(self, color_space_name):
-        w = self.frame_sub_spaces.findChild(PyQt5.QtWidgets.QListWidget, "list_color_spaces_" + color_space_name)
+        w = self.group_colorspaces_all.findChild(PyQt5.QtWidgets.QListWidget, "list_color_spaces_" + color_space_name)
         subspaces = []
         for item in w.selectedItems():
-            subspaces += item.text()
+            subspaces.append(item.text())
         return subspaces
 
     def color_spaces_reselected(self):
-        for index in range(self.horizontalLayout_8.count()):
-            short_name = self.horizontalLayout_8.itemAt(index).widget().objectName()[18:]
+        for index in range(self.horizontalLayout_7.count()):
+            short_name = self.horizontalLayout_7.itemAt(index).widget().objectName()[18:]
             items = self.list_color_spaces.findItems(short_name, PyQt5.QtCore.Qt.MatchExactly)
             if len(items) > 0:
                 enabled = items[0].isSelected()
-                self.horizontalLayout_8.itemAt(index).widget().setEnabled(enabled)
+                self.horizontalLayout_7.itemAt(index).widget().setEnabled(enabled)
 
     def init_color_space(self, color_space_list):
         for i in range(color_space_list.count()):
@@ -1301,11 +1395,6 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         self.progressBar.setVisible(True)
         self.timer.start()
 
-    def slider_compare_file_limit_changed(self):
-        global compare_file_percent
-        compare_file_percent = self.slider_compare_limit.value()
-        self.lbl_compare_limit.setText(str(compare_file_percent) + "%")
-
     def slider_histogram_bands_changed(self):
         global hg_bands_count
         hg_bands_count = self.slider_histogram_bands.value()
@@ -1316,12 +1405,6 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         enforce_equal_folders = self.slider_enforce_equal.value() / 100
         enforce_equal_folders *= enforce_equal_folders
         self.lbl_slider_enforce_equal.setText("%d" % (self.slider_enforce_equal.value() / 3) + "%")
-
-    def choose_groping_parameter(self):
-        global group_by_file_count
-        group_by_file_count = self.radio_folder_size.isChecked()
-        self.spin_num_files.setEnabled(group_by_file_count)
-        self.spin_num_folders.setEnabled(not group_by_file_count)
 
     def drag_timeout(self):
         self.directory_changed()
