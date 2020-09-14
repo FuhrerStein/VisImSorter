@@ -80,6 +80,7 @@ folder_constraint_type = 0
 folder_constraint_value = 0
 stage1_grouping_type = 0
 enable_stage2_grouping = False
+enable_multiprocessing = True
 
 # todo: option to change subfolder naming scheme (add color into the name, number of files)
 # todo: search similar images to sample image or sample folder with images
@@ -91,6 +92,12 @@ enable_stage2_grouping = False
 # todo: modify sorting algorithm so that final number of folders is roughly equal to desired
 # todo: initial grouping is made only using image pairs rather than group pairs
 # todo: when searching for closest pairs, sort also by other bands, not only by HSV hue
+
+# todo: option to group only by pixel count
+# todo: asynchronous interface: enable to change settings while scanning
+# todo: scan forders and calculate difference between images in each
+# todo: convert image_DB into numpy array
+
 
 '''Алгоритм выделения связных компонент
 
@@ -261,8 +268,6 @@ def generate_image_vectors_and_groups(image_list):
     global abort_reason
     global pool
     global folder_size_min_files
-    # global folder_size_min_percent
-    # global min_folder_size_set_in_percent
     global folder_constraint_type
     global folder_constraint_value
 
@@ -394,7 +399,7 @@ def create_groups_v4():
     local_run_index = run_index
     batches = 1
     batch = 0
-    compare_limit = int(compare_file_percent * (image_count + 2000) / 200)
+    compare_limit = int(image_count * .1 + 200)
 
     groups_history = []
     groups_open_history = []
@@ -419,46 +424,78 @@ def create_groups_v4():
     image_belongings_final = image_belongings
     mutual_ratings = (np.tanh(eef01 * (1 - relations_db['rank'] / target_group_size)) + 1) / eef01_divisor
     group_ratings = np.sum((mutual_ratings - np.eye(image_count)) / (1 + relations_db['dist']), axis=1)
+    group_ratings /= group_ratings.max()
+    size_corrector = 1.
+    minimal_distance = relations_db['dist'][relations_db['dist'] > 1].min()
+    mutual_weights = 0
 
-    progress_max = 300
+    progress_max = 1500
     for _ in range(progress_max):
         if (image_belongings == image_belongings_old).all():
             actual_groups = len(np.unique(image_belongings))
             group_sizes = np.bincount(image_belongings, minlength=image_count)
-            actual_groups2 = len(group_sizes.nonzero())
+            # actual_groups2 = len(group_sizes.nonzero())
             image_belongings_final = image_belongings
             if actual_groups > target_groups:
                 # image_belongings = image_index_list
+                # todo: make an elegant a_coefficient function
+                # todo: maybe reset every invite_count on some occasions
+                # todo: use bigger steps for very large number of groups
+                # todo: increase attraction to groups that have least mean distance or right file count
+
+                # desmos
+                # \tanh\left(1-\left(\frac{x}{b}\right)^{c}-\frac{b}{\left(15-a\right)x}\right)
+
+                # cheap sigmoid
+                # \frac{\left(x - b\right)}{2} / (1 +\operatorname{abs}(x-b))+.5
+                # \frac{x-b}{2\left(1+\operatorname{abs}\left(x-b\right)\right)}+.5
+                # \frac{.5}{\operatorname{sign}\left(x-b\right)+\frac{1}{x-b}}+.5
+
+                # mega
+                # \frac{1}{1+20^{5\left(\frac{x}{b}-1\right)}}\cdot\left(\frac{-.5}{\operatorname{sign}\left(x-b\right)+\frac{ab}{x-b}}+.5\right)
+                # \frac{1}{1+20^{\frac{5\left(x-b\right)}{b}}}\cdot\left(\frac{-.5}{\operatorname{sign}\left(x-b\right)+\frac{ab}{x-b}}+.5\right)
+
                 groups_open = (image_belongings == image_index_list)
-                invite_count *= np.tanh(1 - group_sizes / target_group_size) * groups_open * .2 + 1.2
-                mutual_ratings = (np.tanh(eef01 * (1 - relations_db['rank'] / invite_count)) + 1) / eef01_divisor
-                # if isinstance(group_ratings, int):
-                # print(invite_count)
+                size_corrector *= 1.1
+                distance_limit = minimal_distance * size_corrector ** .2
+                mutual_distance = relations_db['dist'] - distance_limit
+                distance_weights = .5 - .5 / (np.sign(mutual_distance) + 1 / mutual_distance)
+                # distance_weights = (.5 - .5 / (np.sign(mutual_distance) + .05 * distance_limit / mutual_distance))
+                # distance_weights /= (1 + 20 ** (5 * mutual_distance / distance_limit))
+                mutual_weights = distance_weights # * group_size_weights
+                group_ratings = np.sum(mutual_weights / (relations_db['dist'] + 500) * (1 - np.eye(image_count)), axis=1)
+                group_ratings /= group_ratings.max()
+                image_belongings = image_index_list
+                # print(_, actual_groups, size_corrector)
+
             else:
                 break
 
-        groups_history.append(image_belongings)
-        groups_open_history.append(groups_open)
+        # groups_history.append(image_belongings)
+        # groups_open_history.append(groups_open)
         # group_ratings_history.append(group_ratings)
         # group_invites_history.append(group_invites)
 
         image_belongings_old = image_belongings
         groups_open_ratings = (image_belongings == image_index_list) * group_ratings
-        group_invites = mutual_ratings * groups_open_ratings
+        group_invites = mutual_weights * groups_open_ratings
         image_belongings = np.argmax(group_invites, axis=1)
 
         closed_groups_indexes = (image_belongings != image_index_list).nonzero()
         images_in_closed_groups = np.isin(image_belongings, closed_groups_indexes)
+        # invite_count = ma.array(invite_count, mask=images_in_closed_groups).filled(np.ones(image_count) * target_group_size)
         image_belongings = ma.array(image_belongings, mask=images_in_closed_groups).filled(image_index_list)
 
         progress_value = _
         QApplication.processEvents()
 
-    base_image_names = np.array([os.path.basename(i[0][0]) for i in image_DB])
-    save_log(groups_history, "groups_history", base_image_names)
-    save_log(groups_open_history, "groups_open_history", base_image_names)
+    # base_image_names = np.array([os.path.basename(i[0][0]) for i in image_DB])
+    # save_log(groups_history, "groups_history", base_image_names)
+    # save_log(groups_open_history, "groups_open_history", base_image_names)
 
     status_text = "(4/4) Grouping images..."
+    progress_value = 0
+    QApplication.processEvents()
 
     center_index_list = np.unique(image_belongings_final)
 
@@ -502,16 +539,18 @@ def create_relations_db(im_db, batch, batches, compare_lim):
 
     for im_1 in np.array_split(image_index_list, batches)[batch]:
         second_range = np.roll(image_index_list, compare_lim - im_1)
-        im_1_db = np.zeros(im_count, dtype=[('dist', np.float), ('rank', np.float), ('im_1', np.int), ('im_2', np.int)])
+        im_1_db = np.zeros(im_count, dtype=[('dist', np.float), ('rank', np.int32), ('im_1', np.int), ('im_2', np.int)])
         im_1_db['im_1'] = im_1
         im_1_db['im_2'] = second_range
         im_1_db['dist'] = np.inf
-        im_1_coord = im_db[im_1][1].astype(np.int32)
-        im_2_coordinates = base_image_coordinates[second_range[:compare_count]].astype(np.int32)
-        vector_distance_line = la_norm(im_2_coordinates - im_1_coord, axis=1)
+        # im_1_coordinates = im_db[im_1][1].astype(np.int32)
+        # im_2_coordinates = base_image_coordinates[second_range[:compare_count]].astype(np.int32)
+        im_1_coordinates = im_db[im_1][1]
+        im_2_coordinates = base_image_coordinates[second_range[:compare_count]]
+        vector_distance_line = la_norm((im_2_coordinates - im_1_coordinates).astype(np.int32), axis=1)
         im_1_db[:compare_count]['dist'] = vector_distance_line
         im_1_db.sort(order='dist')
-        im_1_db['rank'] = image_index_list
+        im_1_db['rank'] = image_index_list.astype(np.int32)
         im_1_db.sort(order='im_2')
         relations_db.append(im_1_db)
         progress_value = im_1
@@ -529,7 +568,7 @@ def save_log(log_values, log_name, base_image_names):
             os.makedirs(logs_dir)
         except Exception as e:
             print("Could not create folder ", e)
-    np.savetxt(logs_dir + log_name + ".csv", np.vstack([base_image_names, log_values]), fmt='%s', delimiter=";")
+    np.savetxt(logs_dir + log_name + ".csv", np.vstack([base_image_names, log_values]), fmt='%s', delimiter=";", encoding="utf-8")
 
 
 def create_groups_by_similarity():
@@ -1235,6 +1274,7 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         self.init_elements()
 
     def init_elements(self):
+        global start_folder
 
         self.font.setPointSize(14)
 
@@ -1269,6 +1309,11 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         self.progressBar.setVisible(False)
         self.enable_elements()
 
+        if len(sys.argv) > 1:
+            if os.path.isdir(sys.argv[1]):
+                start_folder = sys.argv[1]
+                self.directory_changed()
+
     def start_button_pressed(self):
         global target_groups
         global target_group_size
@@ -1293,6 +1338,7 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         global folder_constraint_type
         global folder_constraint_value
         global stage1_grouping_type
+        global enable_multiprocessing
 
         local_run_index = run_index
 
@@ -1305,6 +1351,7 @@ class VisImSorterGUI(QMainWindow, VisImSorterInterface.Ui_VisImSorter):
         create_samples_enabled = self.check_create_samples.isChecked()
         enable_stage2_grouping = self.check_stage2_grouping.isChecked()
         stage1_grouping_type = self.combo_stage1_grouping.currentIndex()
+        enable_multiprocessing = self.check_multiprocessing.isChecked()
 
         final_sort = self.combo_final_sort.currentIndex()
         if self.check_equal_name.isChecked():
